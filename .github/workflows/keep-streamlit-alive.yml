@@ -1,0 +1,31 @@
+name: 🌅 Đánh thức Streamlit Apps
+
+on:
+  schedule:
+    # Chạy mỗi 10 tiếng (0h, 10h, 20h theo giờ UTC = 7h, 17h, 3h giờ VN)
+    - cron: '0 */10 * * *'
+  workflow_dispatch:  # Cho phép chạy thủ công từ GitHub
+
+jobs:
+  wake-apps:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: 📥 Checkout repo
+        uses: actions/checkout@v4
+
+      - name: 🐍 Cài Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 📦 Cài dependencies
+        run: |
+          pip install selenium webdriver-manager
+
+      - name: 🌐 Cài Chrome & ChromeDriver
+        uses: browser-actions/setup-chrome@v1
+
+      - name: 🚀 Chạy script đánh thức
+        run: python wake_streamlit.py
