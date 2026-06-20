@@ -25,6 +25,7 @@ STREAMLIT_APPS = [
     "https://thongketruycap.streamlit.app/",
     "https://tomtatvanban.streamlit.app/",
     "https://tomtattinbai.streamlit.app/",
+    "https://tgdv-miniapp-app.streamlit.app/",
 ]
 
 def create_driver():
