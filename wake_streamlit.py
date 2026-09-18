@@ -14,6 +14,7 @@ from selenium.webdriver.chrome.options import Options
 # Danh sách tất cả app cần keep alive
 STREAMLIT_APPS = [
     "https://congvieccanhan.streamlit.app/",
+    "https://thuvien-python-ngacvantuan.streamlit.app/",
     "https://chatbot-nghiquyet-xiv.streamlit.app/",
     "https://ngacvantuanbantivi.streamlit.app/",
     "https://bantinchibo.streamlit.app/",
