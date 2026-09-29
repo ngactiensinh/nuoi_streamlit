@@ -2,14 +2,20 @@ name: 🌅 Đánh thức Streamlit Apps
 
 on:
   schedule:
-    # Chạy mỗi 10 tiếng (0h, 10h, 20h theo giờ UTC = 7h, 17h, 3h giờ VN)
-    - cron: '0 */10 * * *'
+    # Mỗi 6 tiếng, vào phút 17 (tránh đầu giờ vì GitHub hay dồn lịch, chạy trễ)
+    # 00:17, 06:17, 12:17, 18:17 UTC = 07:17, 13:17, 19:17, 01:17 giờ VN
+    - cron: '17 */6 * * *'
   workflow_dispatch:  # Cho phép chạy thủ công từ GitHub
+
+# Không cho 2 lượt chạy chồng lên nhau
+concurrency:
+  group: wake-streamlit
+  cancel-in-progress: false
 
 jobs:
   wake-apps:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
 
     steps:
       - name: 📥 Checkout repo
@@ -21,11 +27,26 @@ jobs:
           python-version: '3.11'
 
       - name: 📦 Cài dependencies
-        run: |
-          pip install selenium webdriver-manager
+        run: pip install selenium
 
       - name: 🌐 Cài Chrome & ChromeDriver
+        id: setup-chrome
         uses: browser-actions/setup-chrome@v1
+        with:
+          chrome-version: stable
+          install-chromedriver: true
 
       - name: 🚀 Chạy script đánh thức
+        env:
+          CHROME_PATH: ${{ steps.setup-chrome.outputs.chrome-path }}
+          CHROMEDRIVER_PATH: ${{ steps.setup-chrome.outputs.chromedriver-path }}
         run: python wake_streamlit.py
+
+      - name: 📸 Lưu ảnh chụp các app có vấn đề
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: screenshots-${{ github.run_number }}
+          path: screenshots/
+          if-no-files-found: ignore
+          retention-days: 7
