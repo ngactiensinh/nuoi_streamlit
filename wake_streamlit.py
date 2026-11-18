@@ -1,21 +1,30 @@
 """
 Script tự động đánh thức các app Streamlit Community Cloud đang ngủ đông.
 
-Phiên bản 2 — sửa lỗi "app vẫn ngủ dù script có chạy":
-- Không còn mặc định "không thấy nút = app đang chạy". Script chỉ coi app là
-  đang chạy khi thực sự thấy giao diện Streamlit (data-testid="stApp").
-- Tìm nút đánh thức theo nhiều cách, cả trong trang chính lẫn trong iframe.
-- Sau khi bấm, chờ tới khi app lên thật (tối đa 3 phút) rồi mới báo thành công.
+Phiên bản 3 — sửa lỗi "job chạy quá 1 tiếng bị hủy, app cuối danh sách không
+bao giờ được đánh thức" (như tomtattinbai):
+- Chạy SONG SONG nhiều app một lúc (mặc định 4), mỗi app một trình duyệt riêng.
+- Có ngân sách thời gian tổng (mặc định 45 phút): gần hết giờ thì bỏ lượt thử
+  lại để kịp in kết quả, không bao giờ bị GitHub hủy giữa chừng.
+- In log ngay lập tức (không bị giữ trong bộ đệm), log của từng app in thành
+  một khối liền, không lẫn vào nhau.
+- Nhận biết thêm trang "vượt giới hạn tài nguyên" (cần Reboot thủ công) và
+  trang "không có quyền / app không tồn tại".
+
+Giữ nguyên từ bản 2:
+- Chỉ coi app là đang chạy khi thực sự thấy giao diện Streamlit (stApp).
+- Tìm nút đánh thức ở trang chính lẫn trong iframe, bấm xong chờ app lên thật.
 - Ở lại mỗi app một lúc để Streamlit ghi nhận có lượt truy cập.
-- Chụp màn hình các app có vấn đề (thư mục screenshots/) để xem lại trên GitHub.
-- Mỗi app dùng một trình duyệt riêng, lỗi app này không kéo theo app khác.
+- Chụp màn hình app có vấn đề (thư mục screenshots/).
 - Có app lỗi/vẫn ngủ thì thoát mã 1 để GitHub báo đỏ và gửi email.
 """
 
 import os
 import re
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -24,6 +33,12 @@ from selenium.common.exceptions import WebDriverException
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
+
+# In log ra ngay, không giữ trong bộ đệm
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+except AttributeError:
+    pass
 
 # ---------------------------------------------------------------------------
 # Danh sách app cần giữ thức
@@ -51,12 +66,18 @@ STREAMLIT_APPS = [
 # ---------------------------------------------------------------------------
 # Cấu hình thời gian (giây)
 # ---------------------------------------------------------------------------
-PAGE_LOAD_TIMEOUT = 90   # tối đa chờ tải trang
-DETECT_TIMEOUT = 60      # tối đa chờ để nhận ra trạng thái ban đầu của app
-WAKE_TIMEOUT = 180       # tối đa chờ app khởi động sau khi bấm đánh thức
+MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "4"))          # số app chạy cùng lúc
+TOTAL_BUDGET = int(os.environ.get("TOTAL_BUDGET", str(45 * 60)))  # ngân sách tổng
+
+PAGE_LOAD_TIMEOUT = 60   # tối đa chờ tải trang
+DETECT_TIMEOUT = 45      # tối đa chờ để nhận ra trạng thái ban đầu của app
+WAKE_TIMEOUT = 150       # tối đa chờ app khởi động sau khi bấm đánh thức
 STAY_SECONDS = 15        # ở lại app đang chạy để Streamlit tính là có truy cập
 POLL_INTERVAL = 5
 RETRY_DELAY = 10
+
+# Thời gian xấu nhất cho một lượt xử lý một app (dùng để quyết định có thử lại)
+APP_WORST_CASE = PAGE_LOAD_TIMEOUT + DETECT_TIMEOUT + WAKE_TIMEOUT + STAY_SECONDS + 30
 
 SCREENSHOT_DIR = Path("screenshots")
 
@@ -64,6 +85,13 @@ SCREENSHOT_DIR = Path("screenshots")
 SLEEP_MARKERS = ["get this app back up", "gone to sleep", "zzzz"]
 BOOT_MARKERS = ["in the oven", "spinning up", "waking up", "is starting", "restarting"]
 ERROR_MARKERS = ["oh no.", "error running app", "has encountered an error"]
+LIMIT_MARKERS = ["resource limits", "gone over its resource"]
+NO_ACCESS_MARKERS = [
+    "do not have access to this app",
+    "app does not exist",
+    "it does not exist",
+    "you do not have access",
+]
 
 # Các cách tìm nút "Yes, get this app back up!"
 WAKE_XPATHS = [
@@ -74,7 +102,10 @@ WAKE_XPATHS = [
 ]
 
 # Kết quả nào tính là thất bại (làm workflow báo đỏ)
-FAIL_STATUSES = {"still_sleeping", "app_error", "error", "unknown"}
+FAIL_STATUSES = {
+    "still_sleeping", "app_error", "over_limit", "no_access",
+    "error", "unknown", "skipped",
+}
 
 STATUS_LABELS = {
     "already_awake": "✅ Đang chạy",
@@ -82,11 +113,42 @@ STATUS_LABELS = {
     "booting": "⏳ Đang khởi động (chưa xong)",
     "still_sleeping": "💤 Vẫn ngủ",
     "app_error": "🟥 App báo lỗi",
+    "over_limit": "🟧 Vượt giới hạn tài nguyên (cần Reboot)",
+    "no_access": "🔒 Không truy cập được / sai địa chỉ",
     "error": "❌ Lỗi trình duyệt/mạng",
     "unknown": "❓ Không xác định",
+    "skipped": "⏭️ Bỏ qua (hết thời gian)",
 }
 
 VN_TZ = timezone(timedelta(hours=7))
+START_TIME = time.time()
+PRINT_LOCK = threading.Lock()
+
+
+def time_left():
+    return TOTAL_BUDGET - (time.time() - START_TIME)
+
+
+def elapsed_str():
+    sec = int(time.time() - START_TIME)
+    return f"{sec // 60:02d}:{sec % 60:02d}"
+
+
+class AppLog:
+    """Gom log của một app, in ra thành một khối khi xong để không bị lẫn."""
+
+    def __init__(self):
+        self.lines = []
+
+    def __call__(self, msg):
+        self.lines.append(msg)
+
+    def flush(self):
+        if not self.lines:
+            return
+        with PRINT_LOCK:
+            print("\n".join(self.lines), flush=True)
+        self.lines = []
 
 
 # ---------------------------------------------------------------------------
@@ -185,12 +247,16 @@ def has_running_app(driver):
 
 
 def detect_state(driver):
-    """Trả về: running / sleeping / booting / error_page / unknown."""
+    """Trả về: running / sleeping / booting / error_page / over_limit / no_access / unknown."""
     text = collect_text(driver)
     if any(m in text for m in SLEEP_MARKERS):
         return "sleeping"
     if has_running_app(driver):
         return "running"
+    if any(m in text for m in LIMIT_MARKERS):
+        return "over_limit"
+    if any(m in text for m in NO_ACCESS_MARKERS):
+        return "no_access"
     if any(m in text for m in ERROR_MARKERS):
         return "error_page"
     if any(m in text for m in BOOT_MARKERS):
@@ -258,78 +324,88 @@ def app_name(url):
     return host.replace(".streamlit.app", "")
 
 
-def screenshot(driver, url, tag):
+def screenshot(driver, url, tag, log):
     try:
         SCREENSHOT_DIR.mkdir(exist_ok=True)
         path = SCREENSHOT_DIR / f"{app_name(url)}_{tag}.png"
         safe_default(driver)
         driver.save_screenshot(str(path))
-        print(f"  📸 Đã chụp màn hình: {path}")
+        log(f"  📸 Đã chụp màn hình: {path}")
     except WebDriverException:
         pass
 
 
-def stay_on_app(driver):
-    """Ở lại app một lúc để Streamlit ghi nhận lượt truy cập."""
-    time.sleep(STAY_SECONDS)
+FINAL_STATE_TO_STATUS = {
+    "error_page": ("app_error", "🟥 App đang báo lỗi (vào Streamlit Cloud xem log)"),
+    "over_limit": ("over_limit", "🟧 App vượt giới hạn tài nguyên — vào Manage app → Reboot"),
+    "no_access": ("no_access", "🔒 Không truy cập được (app private / sai địa chỉ / đã xóa)"),
+}
 
 
-def process_app(url, attempt):
-    print(f"\n🔍 [{attempt}] Đang kiểm tra: {url}")
+def process_app(url, attempt, log):
+    log(f"\n🔍 [{elapsed_str()}] [lần {attempt}] {url}")
     driver = None
     try:
         driver = create_driver()
         driver.get(url)
 
         state = wait_for_state(
-            driver, DETECT_TIMEOUT, {"running", "sleeping", "error_page"}
+            driver, DETECT_TIMEOUT,
+            {"running", "sleeping", "error_page", "over_limit", "no_access"},
         )
-        print(f"  • Trạng thái ban đầu: {state}")
+        log(f"  • Trạng thái ban đầu: {state}")
 
         if state == "running":
-            stay_on_app(driver)
-            print("  ✅ App đang chạy")
+            time.sleep(STAY_SECONDS)
+            log("  ✅ App đang chạy")
             return "already_awake"
 
-        if state == "error_page":
-            screenshot(driver, url, "app_error")
-            print("  🟥 App đang báo lỗi (cần vào Streamlit Cloud xem log)")
-            return "app_error"
+        if state in FINAL_STATE_TO_STATUS:
+            status, msg = FINAL_STATE_TO_STATUS[state]
+            screenshot(driver, url, status, log)
+            log(f"  {msg}")
+            return status
 
         if state == "sleeping":
             if not click_wake_button(driver):
-                screenshot(driver, url, "no_button")
-                print("  💤 App đang ngủ nhưng KHÔNG tìm thấy nút đánh thức")
+                screenshot(driver, url, "no_button", log)
+                log("  💤 App đang ngủ nhưng KHÔNG tìm thấy nút đánh thức")
                 return "still_sleeping"
-            print("  👆 Đã bấm nút đánh thức, chờ app khởi động...")
+            log("  👆 Đã bấm nút đánh thức, chờ app khởi động...")
             time.sleep(POLL_INTERVAL)
 
         # Sau khi bấm (hoặc trạng thái ban đầu là booting/unknown): chờ app lên
-        state = wait_for_state(driver, WAKE_TIMEOUT, {"running", "error_page"})
+        state = wait_for_state(
+            driver, WAKE_TIMEOUT,
+            {"running", "error_page", "over_limit", "no_access"},
+        )
 
         if state == "running":
-            stay_on_app(driver)
-            print("  🟢 App đã chạy")
+            time.sleep(STAY_SECONDS)
+            log("  🟢 App đã chạy")
             return "woken"
 
-        screenshot(driver, url, state)
-        if state == "error_page":
-            print("  🟥 App khởi động bị lỗi")
-            return "app_error"
+        if state in FINAL_STATE_TO_STATUS:
+            status, msg = FINAL_STATE_TO_STATUS[state]
+            screenshot(driver, url, status, log)
+            log(f"  {msg}")
+            return status
+
+        screenshot(driver, url, state, log)
         if state == "sleeping":
-            print("  💤 Bấm rồi nhưng app vẫn ngủ")
+            log("  💤 Bấm rồi nhưng app vẫn ngủ")
             return "still_sleeping"
         if state == "booting":
-            print("  ⏳ App vẫn đang khởi động sau thời gian chờ")
+            log("  ⏳ App vẫn đang khởi động sau thời gian chờ")
             return "booting"
-        print("  ❓ Không nhận ra trạng thái trang")
+        log("  ❓ Không nhận ra trạng thái trang")
         return "unknown"
 
     except WebDriverException as e:
         msg = str(e).splitlines()[0] if str(e) else type(e).__name__
-        print(f"  ❌ Lỗi trình duyệt: {msg}")
+        log(f"  ❌ Lỗi trình duyệt: {msg}")
         if driver:
-            screenshot(driver, url, "error")
+            screenshot(driver, url, "error", log)
         return "error"
     finally:
         if driver:
@@ -339,6 +415,34 @@ def process_app(url, attempt):
                 pass
 
 
+def handle_app(url):
+    """Xử lý một app, có thử lại một lần nếu còn đủ thời gian."""
+    log = AppLog()
+
+    if time_left() < APP_WORST_CASE:
+        log(f"\n⏭️  Bỏ qua {url} — không còn đủ thời gian")
+        log.flush()
+        return url, "skipped", 0
+
+    status = process_app(url, 1, log)
+    attempts = 1
+
+    # Không thử lại với lỗi cần xử lý thủ công (vượt tài nguyên, không có quyền)
+    retryable = status in {"still_sleeping", "app_error", "error", "unknown", "booting"}
+    if retryable:
+        if time_left() > APP_WORST_CASE + RETRY_DELAY:
+            log(f"  🔁 Thử lại sau {RETRY_DELAY} giây...")
+            log.flush()
+            time.sleep(RETRY_DELAY)
+            status = process_app(url, 2, log)
+            attempts = 2
+        else:
+            log("  ⏱️  Không thử lại vì sắp hết thời gian")
+
+    log.flush()
+    return url, status, attempts
+
+
 def write_github_summary(rows, counts):
     summary_file = os.environ.get("GITHUB_STEP_SUMMARY")
     if not summary_file:
@@ -346,6 +450,7 @@ def write_github_summary(rows, counts):
     now = datetime.now(VN_TZ).strftime("%H:%M %d/%m/%Y")
     lines = [
         f"## 🌅 Kết quả đánh thức Streamlit — {now} (giờ VN)",
+        f"Thời gian chạy: {elapsed_str()} · Chạy song song: {MAX_WORKERS} app",
         "",
         "| App | Kết quả | Số lần thử |",
         "|---|---|---|",
@@ -363,31 +468,41 @@ def write_github_summary(rows, counts):
 def main():
     print("=" * 60)
     print("  🚀 BẮT ĐẦU KIỂM TRA VÀ ĐÁNH THỨC CÁC APP STREAMLIT")
-    print("=" * 60)
+    print(f"  {len(STREAMLIT_APPS)} app · song song {MAX_WORKERS} · "
+          f"ngân sách {TOTAL_BUDGET // 60} phút")
+    print("=" * 60, flush=True)
 
     counts = {k: 0 for k in STATUS_LABELS}
-    rows = []
+    results = {}
 
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+        futures = {pool.submit(handle_app, url): url for url in STREAMLIT_APPS}
+        for fut in as_completed(futures):
+            url = futures[fut]
+            try:
+                _, status, attempts = fut.result()
+            except Exception as e:  # phòng lỗi bất ngờ, không để sập cả lượt
+                with PRINT_LOCK:
+                    print(f"\n❌ Lỗi không mong đợi với {url}: {e}", flush=True)
+                status, attempts = "error", 1
+            results[url] = (status, attempts)
+
+    # Giữ đúng thứ tự danh sách khi in kết quả
+    rows = []
     for url in STREAMLIT_APPS:
-        status = process_app(url, 1)
-        attempts = 1
-        if status in FAIL_STATUSES or status == "booting":
-            print(f"  🔁 Thử lại sau {RETRY_DELAY} giây...")
-            time.sleep(RETRY_DELAY)
-            status = process_app(url, 2)
-            attempts = 2
+        status, attempts = results[url]
         counts[status] += 1
         rows.append((url, status, attempts))
 
     print("\n" + "=" * 60)
-    print("  📊 KẾT QUẢ:")
+    print(f"  📊 KẾT QUẢ (chạy hết {elapsed_str()}):")
     for url, status, attempts in rows:
-        print(f"  {STATUS_LABELS[status]:<32} {app_name(url)}  (thử {attempts} lần)")
+        print(f"  {STATUS_LABELS[status]:<40} {app_name(url)}  (thử {attempts} lần)")
     print("-" * 60)
     for key, value in counts.items():
         if value:
-            print(f"  {STATUS_LABELS[key]:<32}: {value} app")
-    print("=" * 60)
+            print(f"  {STATUS_LABELS[key]:<40}: {value} app")
+    print("=" * 60, flush=True)
 
     write_github_summary(rows, counts)
 
